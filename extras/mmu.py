@@ -1010,6 +1010,15 @@ class Mmu:
         self.slicer_tool_map = {'tools': {}, 'initial_tool': None, 'purge_volumes': []}
         self.slicer_color_rgb = [(0.,0.,0.)] * self.mmu_num_gates
 
+        # Clear 'color' on Tx macros
+        for tool in range(self.mmu_num_gates):
+            t_macro = self.printer.lookup_object("gcode_macro T%d" % tool, None)
+            if t_macro:
+                try:
+                    del t_macro.variables['color']
+                except:
+                    pass
+
     # Helper to infer type for setting gcode macro variables
     def _fix_type(self, s):
         try:
@@ -1021,12 +1030,17 @@ class Mmu:
                 return s
 
     # This retuns a convenient RGB spec for controlling LEDs in form (0.32, 0.56, 1.00)
-    def _color_to_rgb(self, color):
+    def _color_to_hex_rgb(self, color):
         if color in self.w3c_colors:
             color = self.w3c_colors.get(color)
         elif color == '':
             color = "#000000"
         hex_rgb = color.lstrip('#')
+        return hex_rgb
+
+    # This retuns a convenient RGB spec for controlling LEDs in form (0.32, 0.56, 1.00)
+    def _color_to_rgb(self, color):
+        hex_rgb = self._color_to_hex_rgb(color)
         length = len(hex_rgb)
         if length % 3 == 0:
             return tuple(round(float(int(hex_rgb[i:i + length // 3], 16)) / 255, 3) for i in range(0, length, length // 3))
@@ -1064,6 +1078,13 @@ class Mmu:
             tool = int(tool_key)
             gate = self.ttg_map[tool]
             self.slicer_color_rgb[gate] = self._color_to_rgb(tool_value['color'])
+
+            # Set 'color' variable on the Tx macro for Mainsail/Fluidd to pick up
+            t_macro = self.printer.lookup_object("gcode_macro T%d" % tool, None)
+            if t_macro:
+                hex_rgb = self._color_to_hex_rgb(tool_value['color'])
+                t_macro.variables.update({'color': hex_rgb})
+
         if self.printer.lookup_object("gcode_macro %s" % self.gate_map_changed_macro, None) is not None:
             self._wrap_gcode_command("%s GATE=-1" % self.gate_map_changed_macro) # Cheat to force LED update
 
@@ -2701,7 +2722,7 @@ class Mmu:
         self._set_gate_ratio(self._get_gate_ratio(self.gate_selected) / multiplier)
 
     def _is_printer_printing(self):
-        return self.print_stats.state == "printing"
+        return self.print_stats and self.print_stats.state == "printing"
 
     def _is_printer_paused(self):
         return self.pause_resume.is_paused
@@ -4159,7 +4180,7 @@ class Mmu:
             start_filament_pos = self.filament_pos
             if self.gcode_load_sequence:
                 self._log_debug("Calling external user defined loading sequence macro")
-                self._wrap_gcode_command("_MMU_LOAD_SEQUENCE FILAMENT_POS=%d LENGTH=%.1f FULL=%d HOME_EXTRUDER=%d SKIP_EXTRUDER=%d EXTRUDER_ONLY=%d" % (start_filament_pos, length, int(full), int(home), int(skip_extruder), int(extruder_only)), exception=True)
+                self._wrap_gcode_command("%s FILAMENT_POS=%d LENGTH=%.1f FULL=%d HOME_EXTRUDER=%d SKIP_EXTRUDER=%d EXTRUDER_ONLY=%d" % (self.load_sequence_macro, start_filament_pos, length, int(full), int(home), int(skip_extruder), int(extruder_only)), exception=True)
 
             elif extruder_only:
                 if start_filament_pos < self.FILAMENT_POS_EXTRUDER_ENTRY:
@@ -4251,7 +4272,7 @@ class Mmu:
             unload_to_buffer = (start_filament_pos >= self.FILAMENT_POS_END_BOWDEN and not extruder_only)
             if self.gcode_unload_sequence:
                 self._log_debug("Calling external user defined unloading sequence macro")
-                self._wrap_gcode_command("_MMU_UNLOAD_SEQUENCE FILAMENT_POS=%d LENGTH=%.1f EXTRUDER_ONLY=%d PARK_POS=%.1f" % (start_filament_pos, length, extruder_only, park_pos), exception=True)
+                self._wrap_gcode_command("%s FILAMENT_POS=%d LENGTH=%.1f EXTRUDER_ONLY=%d PARK_POS=%.1f" % (self.unload_sequence_macro, start_filament_pos, length, extruder_only, park_pos), exception=True)
 
             elif extruder_only:
                 if start_filament_pos >= self.FILAMENT_POS_EXTRUDER_ENTRY:
@@ -6475,6 +6496,7 @@ class Mmu:
         material = gcmd.get('MATERIAL', "unknown")
         color = gcmd.get('COLOR', "").lower()
         temp = gcmd.get_int('TEMP', 0, minval=0)
+        used = bool(gcmd.get_int('USED', 1, minval=0, maxval=1))
         purge_volumes = gcmd.get('PURGE_VOLUMES', "")
 
         quiet = False
@@ -6482,7 +6504,7 @@ class Mmu:
             self._clear_slicer_tool_map()
             quiet = True
         if tool >= 0:
-            self.slicer_tool_map['tools'][str(tool)] = {'color': color, 'material': material, 'temp': temp}
+            self.slicer_tool_map['tools'][str(tool)] = {'color': color, 'material': material, 'temp': temp, 'in_use': used}
             if color:
                 self._update_slicer_color()
             quiet = True
@@ -6518,7 +6540,8 @@ class Mmu:
             quiet = True
 
         if display or not quiet:
-            colors = len(self.slicer_tool_map['tools'])
+            colors = sum(1 for tool in self.slicer_tool_map['tools'] if self.slicer_tool_map['tools'][tool]['in_use'])
+
             have_purge_map = len(self.slicer_tool_map['purge_volumes']) > 0
             msg = "No slicer tool map loaded"
             if colors > 0 or self.slicer_tool_map['initial_tool'] is not None:
@@ -6526,7 +6549,9 @@ class Mmu:
                 msg += "Single color print" if colors <= 1 else "%d color print" % colors
                 msg += " (Purge volume map loaded)\n" if colors > 1 and have_purge_map else "\n"
                 for t, params in self.slicer_tool_map['tools'].items():
-                    msg += "T%d (Gate %d, %s, %s, %d%sC)\n" % (int(t), self.ttg_map[int(t)], params['material'], params['color'], params['temp'], UI_DEGREE)
+                    if params['in_use'] or detail:
+                        msg += "T%d (Gate %d, %s, %s, %d%sC)" % (int(t), self.ttg_map[int(t)], params['material'], params['color'], params['temp'], UI_DEGREE)
+                        msg += " Not used\n" if detail and not params['in_use'] else "\n"
                 if self.slicer_tool_map['initial_tool'] is not None:
                     msg += "Initial Tool: T%d\n" % self.slicer_tool_map['initial_tool']
                 msg += "-------------------------------------------"
